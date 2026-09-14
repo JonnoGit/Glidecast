@@ -11,6 +11,14 @@ npm install
 npx playwright install chromium
 ```
 
+## Mac app
+
+```bash
+npm run app        # builds dist/Glidecast.app and installs it to /Applications
+```
+
+The app opens the editor in its own window. It starts the server when it launches and stops it when you quit. It runs the project from the folder it was built in, so rebuild it if you move the folder. The server log is at `~/Library/Logs/Glidecast.log`, and File → Open Renders Folder (⌘O) opens `renders/`.
+
 ## Quick start
 
 ```bash

@@ -4,7 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "record": "node record.js"
+    "record": "node record.js",
+    "app": "bash macos/build.sh --install"
   },
   "license": "UNLICENSED",
   "description": "Headless webpage scroll recorder with real motion blur, eased checkpoints, and a web editor",
