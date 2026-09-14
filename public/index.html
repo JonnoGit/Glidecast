@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Glidecast</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span>Glidecast</div>
+    <form id="urlForm" class="urlbar">
+      <input id="url" type="text" placeholder="https://example.com" spellcheck="false" autocomplete="off" />
+      <button type="submit" class="btn primary" id="loadBtn">Load page</button>
+    </form>
+    <div class="top-actions">
+      <button class="btn ghost" id="importBtn" title="Load a saved project">Import</button>
+      <button class="btn ghost" id="exportBtn" title="Save this project as JSON">Export</button>
+      <input type="file" id="importFile" accept="application/json" hidden />
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Left: settings -->
+    <aside class="panel left">
+      <section>
+        <h2>Page</h2>
+        <div class="presets" id="sizePresets"></div>
+        <div class="row">
+          <label class="field"><span>Width</span><input type="number" id="width" min="200" max="7680" step="1" /></label>
+          <span class="times">×</span>
+          <label class="field"><span>Height</span><input type="number" id="height" min="200" max="4320" step="1" /></label>
+        </div>
+        <label class="field"><span>Pixel density</span>
+          <select id="dpr"><option value="1">1× (output = page size)</option><option value="2">2× (retina, double resolution)</option></select>
+        </label>
+        <label class="check"><input type="checkbox" id="freshStart" /> Capture intro animations</label>
+        <p class="hint">Starts the video from a fresh page load, so load-in animations play from frame 0 and scroll-triggered ones play when the video reaches them.</p>
+        <p class="hint warn" id="sizeWarn" hidden>Size changed. Reload the page so the preview and checkpoints match.</p>
+      </section>
+
+      <section>
+        <h2>Output</h2>
+        <div class="row">
+          <label class="field"><span>FPS</span>
+            <select id="fps"><option>24</option><option>25</option><option>30</option><option>50</option><option>60</option><option>120</option></select>
+          </label>
+          <label class="field"><span>Format</span>
+            <select id="format"><option value="mp4">MP4 (H.264)</option><option value="mov">MOV (ProRes 422 HQ)</option><option value="webm">WebM (VP9)</option></select>
+          </label>
+        </div>
+        <label class="field"><span>File name</span><input type="text" id="fileName" spellcheck="false" placeholder="scroll" /></label>
+        <p class="hint">Saved to <code>renders/</code>. Existing files are never overwritten; a number is added instead.</p>
+      </section>
+
+      <section>
+        <h2 class="with-toggle">Motion blur <label class="switch"><input type="checkbox" id="blur" /><span></span></label></h2>
+        <div id="blurControls">
+          <label class="field"><span>Shutter angle <b id="shutterVal"></b></span>
+            <input type="range" id="shutter" min="15" max="360" step="15" />
+          </label>
+          <label class="field"><span>Blur quality</span>
+            <select id="blurQuality">
+              <option value="1">Best: smooth streaks, slowest</option>
+              <option value="2">Good</option>
+              <option value="4">Fast: faint stepping on thin text</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Hidden elements</h2>
+        <label class="check"><input type="checkbox" id="hideCookies" /> Auto-hide common cookie banners</label>
+        <p class="hint">Or click <b>Reject All</b> / <b>Accept</b> in the preview. Your choice carries into the render. For anything else, choose <b>Pick element to hide</b> and click it in the preview.</p>
+        <ul class="chips" id="hiddenList"></ul>
+        <div class="row">
+          <input type="text" id="hideInput" placeholder="CSS selector" spellcheck="false" />
+          <button class="btn" id="hideAdd">Add</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Center: live page -->
+    <section class="center">
+      <div class="toolbar">
+        <div class="seg" id="modeSeg">
+          <button data-mode="scroll" class="on" title="Scroll and click the page normally">Interact</button>
+          <button data-mode="pick" title="Click an element in the preview to hide it">Pick element to hide</button>
+        </div>
+        <div class="readout"><span class="muted">scrollY</span> <b id="scrollY">–</b><span class="muted"> / <span id="maxScroll">–</span>px</span></div>
+        <div class="spacer"></div>
+        <button class="btn" id="setStartBtn" title="Use this position as the starting frame">Set start here</button>
+        <button class="btn primary big" id="markBtn" title="Shortcut: M">＋ Mark checkpoint <kbd>M</kbd></button>
+      </div>
+
+      <div class="stage-wrap">
+        <div class="stage" id="stage" tabindex="0">
+          <div class="frame" id="frame">
+            <img id="live" alt="" draggable="false" />
+            <div class="hover-box" id="hoverBox" hidden></div>
+          </div>
+          <div class="empty" id="empty">
+            <div class="empty-inner">
+              <h3>Load a page to start</h3>
+              <p>Enter a URL above. The page opens in a headless browser at your chosen size. Scroll it here, and click <b>Mark checkpoint</b> at each place the video should stop.</p>
+            </div>
+          </div>
+          <div class="loading" id="loading" hidden><div class="spinner"></div><span id="loadingMsg"></span></div>
+        </div>
+        <div class="scrubber" id="scrubber" title="Drag to scrub the page">
+          <div class="ticks" id="ticks"></div>
+          <div class="thumb" id="thumb"></div>
+        </div>
+      </div>
+
+      <div class="timeline-panel">
+        <div class="timeline-head">
+          <h2>Timeline</h2>
+          <span class="muted" id="timelineStats"></span>
+          <div class="spacer"></div>
+          <button class="btn" id="previewBtn" title="Play the timing on the live page (no blur, approximate frame rate)">▶ Preview motion</button>
+        </div>
+        <canvas id="timeline"></canvas>
+      </div>
+    </section>
+
+    <!-- Right: checkpoints, tokens, render -->
+    <aside class="panel right">
+      <section class="grow">
+        <h2>Checkpoints <span class="count" id="cpCount"></span></h2>
+        <div id="startCard"></div>
+        <ol class="cards" id="cpList"></ol>
+        <p class="hint" id="cpEmpty">No checkpoints yet. Scroll the preview and press <kbd>M</kbd>.</p>
+      </section>
+
+      <section>
+        <h2 class="with-action">Easing tokens <button class="btn small" id="addToken">＋ New</button></h2>
+        <ul class="tokens" id="tokenList"></ul>
+        <div class="token-editor" id="tokenEditor"></div>
+      </section>
+
+      <section class="render">
+        <div class="row">
+          <button class="btn" id="draftBtn" title="Fast render without motion blur">Draft render</button>
+          <button class="btn primary grow" id="renderBtn">Render video</button>
+        </div>
+        <div class="progress" id="progress" hidden>
+          <div class="bar"><div id="progressBar"></div></div>
+          <div class="row tight"><span id="progressMsg" class="muted ellipsis"></span><button class="btn small" id="cancelBtn">Cancel</button></div>
+        </div>
+        <div class="result" id="result" hidden>
+          <video id="resultVideo" controls playsinline loop></video>
+          <div class="row tight"><span id="resultName" class="ellipsis"></span><button class="btn small" id="revealBtn">Show in Finder</button></div>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "glidecast",
+  "version": "0.1.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "record": "node record.js"
+  },
+  "license": "UNLICENSED",
+  "description": "Headless webpage scroll recorder with real motion blur, eased checkpoints, and a web editor",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.63.0"
+  },
+  "bin": {
+    "glidecast": "record.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

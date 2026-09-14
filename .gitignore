@@ -1,0 +1,8 @@
+node_modules/
+renders/
+.DS_Store
+
+# Rendered videos (example renders can be regenerated from example.json)
+*.mp4
+*.mov
+*.webm

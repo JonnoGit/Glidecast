@@ -1,0 +1,21 @@
+{
+  "url": "https://en.wikipedia.org/wiki/Motion_blur",
+  "output": "example.mp4",
+  "viewport": { "width": 1920, "height": 1080, "deviceScaleFactor": 1 },
+  "fps": 60,
+  "motionBlur": { "enabled": true, "samples": 64, "shutterAngle": 180, "maxStepPx": 1 },
+  "easing": "easeInOutCubic",
+  "hideSelectors": [],
+  "start": "top",
+  "timeline": [
+    { "wait": 1.0 },
+    { "scroll": { "selector": "#Animation", "offset": -40 }, "duration": 1.4, "easing": [0.7, 0, 0.2, 1] },
+    { "wait": 1.5 },
+    { "scroll": "+1400", "duration": 0.9, "easing": { "spring": { "stiffness": 90, "damping": 11 } } },
+    { "wait": 1.0 },
+    { "scroll": "bottom", "speed": 2500, "easing": "easeInOutQuart" },
+    { "wait": 0.75 },
+    { "scroll": "top", "duration": 1.6, "easing": "easeInOutExpo" },
+    { "wait": 1.0 }
+  ]
+}
