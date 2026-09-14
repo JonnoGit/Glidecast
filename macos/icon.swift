@@ -49,73 +49,55 @@ ctx.drawRadialGradient(
   options: [])
 ctx.restoreGState()
 
-// --- Page card ----------------------------------------------------------------
-let card = CGRect(x: 262, y: 214, width: 500, height: 612)
-let cardPath = CGPath(roundedRect: card, cornerWidth: 44, cornerHeight: 44, transform: nil)
+// --- Fat G --------------------------------------------------------------------
+// SF Pro Rounded Black, centered optically, with a faint motion trail trailing upward.
 ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: -18), blur: 36, color: rgb(0x120a40, 0.4))
-ctx.addPath(cardPath)
-ctx.setFillColor(rgb(0xffffff))
-ctx.fillPath()
-ctx.restoreGState()
-
-// Page content, drawn many times with a vertical offset and fading alpha = motion blur.
-func drawContent(dy: CGFloat, alpha: CGFloat) {
-  let x = card.minX + 52
-  let w = card.width - 104
-  func bar(_ y: CGFloat, _ width: CGFloat, _ h: CGFloat, _ color: UInt32) {
-    let r = CGRect(x: x, y: y + dy, width: width, height: h)
-    ctx.addPath(CGPath(roundedRect: r, cornerWidth: h / 2, cornerHeight: h / 2, transform: nil))
-    ctx.setFillColor(rgb(color, alpha))
-    ctx.fillPath()
-  }
-  // Hero image block
-  let hero = CGRect(x: x, y: card.minY + 60 + dy, width: w, height: 170)
-  ctx.addPath(CGPath(roundedRect: hero, cornerWidth: 22, cornerHeight: 22, transform: nil))
-  ctx.setFillColor(rgb(0xd9d3ff, alpha))
-  ctx.fillPath()
-  bar(card.minY + 268, w * 0.78, 30, 0x2b2346)
-  bar(card.minY + 322, w, 18, 0xb9b5cc)
-  bar(card.minY + 356, w * 0.9, 18, 0xb9b5cc)
-  bar(card.minY + 390, w * 0.62, 18, 0xb9b5cc)
-  bar(card.minY + 452, w * 0.7, 30, 0x2b2346)
-  bar(card.minY + 506, w, 18, 0xb9b5cc)
-  bar(card.minY + 540, w * 0.84, 18, 0xb9b5cc)
-  bar(card.minY + 574, w * 0.5, 18, 0xb9b5cc)
-  bar(card.minY + 608, w, 18, 0xb9b5cc)
-}
-
-ctx.saveGState()
-ctx.addPath(cardPath)
+ctx.addPath(bodyPath)
 ctx.clip()
-// Symmetric shutter-style streaks along the scroll direction, sharp frame on top.
-let streaks = 14
-for i in 1...streaks {
-  let t = CGFloat(i) / CGFloat(streaks)
-  let a = 0.16 * (1 - t) + 0.03
-  drawContent(dy: -t * 150, alpha: a)
-  drawContent(dy: t * 60, alpha: a * 0.8)
-}
-drawContent(dy: 0, alpha: 1)
-// Fade the bottom of the card so the page reads as continuing below.
-let fade = CGGradient(
-  colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: [rgb(0xffffff, 0), rgb(0xffffff, 1)] as CFArray,
-  locations: [0, 1])!
-ctx.drawLinearGradient(
-  fade, start: CGPoint(x: 0, y: card.maxY - 90), end: CGPoint(x: 0, y: card.maxY - 4), options: [])
-ctx.restoreGState()
 
-// --- Record dot ---------------------------------------------------------------
-let dotCenter = CGPoint(x: card.maxX - 6, y: card.minY + 6)
+var font = NSFont.systemFont(ofSize: 700, weight: .black)
+if let rounded = font.fontDescriptor.withDesign(.rounded) { font = NSFont(descriptor: rounded, size: 700) ?? font }
+
+func glyphPath() -> CGPath {
+  let line = CTLineCreateWithAttributedString(NSAttributedString(string: "G", attributes: [.font: font]))
+  let run = (CTLineGetGlyphRuns(line) as! [CTRun])[0]
+  var glyph = CGGlyph()
+  CTRunGetGlyphs(run, CFRange(location: 0, length: 1), &glyph)
+  return CTFontCreatePathForGlyph(font as CTFont, glyph, nil)!
+}
+let g = glyphPath()
+let gb = g.boundingBoxOfPath
+// Glyph paths are y-up; flip into our top-left space and center (nudged up a touch).
+func placed(dy: CGFloat) -> CGPath {
+  var t = CGAffineTransform(translationX: 512 - gb.midX, y: 500 + gb.midY + dy).scaledBy(x: 1, y: -1)
+  return g.copy(using: &t)!
+}
+
+// Motion trail
+let trail = 12
+for i in stride(from: trail, through: 1, by: -1) {
+  let t = CGFloat(i) / CGFloat(trail)
+  ctx.addPath(placed(dy: -t * 110))
+  ctx.setFillColor(rgb(0xffffff, 0.07 * (1 - t) + 0.015))
+  ctx.fillPath()
+}
+
+// Solid G with a soft shadow and a subtle top-to-bottom tint
 ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: -6), blur: 16, color: rgb(0x3a0010, 0.4))
-ctx.addEllipse(in: CGRect(x: dotCenter.x - 74, y: dotCenter.y - 74, width: 148, height: 148))
+ctx.setShadow(offset: CGSize(width: 0, height: -16), blur: 30, color: rgb(0x14093f, 0.45))
+ctx.addPath(placed(dy: 0))
 ctx.setFillColor(rgb(0xffffff))
 ctx.fillPath()
 ctx.restoreGState()
-ctx.addEllipse(in: CGRect(x: dotCenter.x - 56, y: dotCenter.y - 56, width: 112, height: 112))
-ctx.setFillColor(rgb(0xff4d5e))
-ctx.fillPath()
+
+ctx.saveGState()
+ctx.addPath(placed(dy: 0))
+ctx.clip()
+let tint = CGGradient(
+  colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: [rgb(0xffffff), rgb(0xe4ddff)] as CFArray, locations: [0, 1])!
+ctx.drawLinearGradient(tint, start: CGPoint(x: 0, y: 500 - gb.height / 2), end: CGPoint(x: 0, y: 500 + gb.height / 2), options: [])
+ctx.restoreGState()
+ctx.restoreGState()
 
 NSGraphicsContext.current = nil
 try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
