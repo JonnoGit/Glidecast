@@ -1,3 +1,4 @@
+import { cameraRect, lerpCamera, normCamera } from "/camera.js";
 import { cubicBezier } from "/easing.js";
 
 // ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ function defaultProject() {
     freshStart: true,
     tokens,
     selectedToken: tokens[0].id,
-    start: { y: 0, hold: 1000 },
+    start: { y: 0, hold: 1000, zoom: 1, anchor: [0.5, 0.5] },
     checkpoints: [],
   };
 }
@@ -87,6 +88,9 @@ const live = {
   inflight: false,
   lastInteraction: 0,
   mode: "scroll",
+  camera: null, // zoom shown while scrubbing or previewing the timeline
+  anchorFor: null, // checkpoint id (or "start") whose zoom anchor is being picked
+  anchorHover: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +125,10 @@ function toast(msg) {
 }
 
 const tokenById = (id) => state.tokens.find((t) => t.id === id) ?? state.tokens[0];
+const itemById = (id) => (id === "start" ? state.start : state.checkpoints.find((c) => c.id === id));
+const camOf = (item) => normCamera(item.zoom, item.anchor);
+const round3 = (v) => Math.round(v * 1000) / 1000;
+const fmtZoom = (z) => `${round2(z)}×`;
 
 // ---------------------------------------------------------------------------
 // Settings panel
@@ -317,16 +325,26 @@ new ResizeObserver(() => {
 function updateLiveUi() {
   const s = stageScale();
   // Optimistic scroll: shift the last frame toward where we've asked the page to be.
-  $("live").style.transform = `translateY(${(live.frameY - live.desiredY) * s}px)`;
+  const dy = (live.frameY - live.desiredY) * s;
+  const cam = live.camera;
+  if (cam && cam.zoom > 1) {
+    const { width, height } = viewSize();
+    const r = cameraRect(cam, width, height);
+    $("live").style.transform = `scale(${cam.zoom}) translate(${-r.x * s}px, ${dy - r.y * s}px)`;
+  } else {
+    $("live").style.transform = `translateY(${dy}px)`;
+  }
+  renderZoomBox();
   $("scrollY").textContent = live.loaded ? Math.round(live.desiredY) : "–";
   $("maxScroll").textContent = live.loaded ? Math.round(live.maxScroll) : "–";
   renderScrubber();
   markActiveCards();
 }
 
-function scrollToY(y, { interaction = true } = {}) {
+function scrollToY(y, { interaction = true, camera = null } = {}) {
   if (!live.loaded) return;
   live.desiredY = Math.round(clamp(y, 0, live.maxScroll));
+  live.camera = camera;
   if (interaction) live.lastInteraction = performance.now();
   updateLiveUi();
   flushScroll();
@@ -367,11 +385,18 @@ $("frame").addEventListener("pointerdown", (e) => (downAt = { x: e.clientX, y: e
 $("frame").addEventListener("pointerup", async (e) => {
   if (!downAt || Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 4) return;
   downAt = null;
-  const rect = $("frame").getBoundingClientRect();
-  const s = stageScale();
-  const x = (e.clientX - rect.left) / s;
-  const y = (e.clientY - rect.top) / s;
-  if (live.mode === "pick") {
+  const { x, y } = pagePoint(e);
+  if (live.mode === "anchor") {
+    const item = itemById(live.anchorFor);
+    const { width, height } = viewSize();
+    if (item) {
+      item.anchor = [round3(clamp(x / width, 0, 1)), round3(clamp(y / height, 0, 1))];
+      if (!(item.zoom > 1)) item.zoom = 2;
+      save();
+    }
+    setMode("scroll");
+    renderAll();
+  } else if (live.mode === "pick") {
     try {
       const { selector } = await api("/api/pick", { x, y });
       if (!selector) return toast("Nothing to hide there");
@@ -386,15 +411,73 @@ $("frame").addEventListener("pointerup", async (e) => {
   }
 });
 
-function setMode(mode) {
+// Pointer position in page CSS px, accounting for the preview's zoom if one is showing.
+function pagePoint(e) {
+  const rect = $("frame").getBoundingClientRect();
+  const s = stageScale();
+  let x = (e.clientX - rect.left) / s;
+  let y = (e.clientY - rect.top) / s;
+  if (live.camera?.zoom > 1) {
+    const { width, height } = viewSize();
+    const r = cameraRect(live.camera, width, height);
+    x = r.x + x / live.camera.zoom;
+    y = r.y + y / live.camera.zoom;
+  }
+  return { x, y };
+}
+
+$("frame").addEventListener("pointermove", (e) => {
+  if (live.mode !== "anchor") return;
+  const { x, y } = pagePoint(e);
+  const { width, height } = viewSize();
+  live.anchorHover = [clamp(x / width, 0, 1), clamp(y / height, 0, 1)];
+  renderZoomBox();
+});
+$("frame").addEventListener("pointerleave", () => {
+  live.anchorHover = null;
+  renderZoomBox();
+});
+
+function setMode(mode, anchorFor = null) {
+  const wasAnchor = live.mode === "anchor";
   live.mode = mode;
+  live.anchorFor = mode === "anchor" ? anchorFor : null;
+  live.anchorHover = null;
   stage.classList.toggle("pick", mode === "pick");
+  stage.classList.toggle("anchor", mode === "anchor");
   for (const b of $("modeSeg").children) b.classList.toggle("on", b.dataset.mode === mode);
+  if (wasAnchor || mode === "anchor") renderCheckpoints();
+  renderZoomBox();
 }
 $("modeSeg").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (b) setMode(b.dataset.mode);
 });
+
+// Zoom box: outlines what a zoomed checkpoint will show, for the checkpoint at the current position
+// (or the one whose anchor is being picked, following the pointer).
+function renderZoomBox() {
+  const box = $("zoomBox");
+  let item = null;
+  let anchor = null;
+  if (live.mode === "anchor") {
+    item = itemById(live.anchorFor);
+    anchor = live.anchorHover;
+  } else if (!live.camera) {
+    const y = Math.round(live.desiredY);
+    item = [state.start, ...state.checkpoints].find((c) => Math.abs(c.y - y) <= 1 && camOf(c).zoom > 1);
+  }
+  box.hidden = !live.loaded || !item;
+  if (box.hidden) return;
+  const cam = camOf({ zoom: item.zoom, anchor: anchor ?? item.anchor });
+  const { width, height } = viewSize();
+  const s = stageScale();
+  const r = cameraRect(cam, width, height);
+  Object.assign(box.style, { left: `${r.x * s}px`, top: `${r.y * s}px`, width: `${r.width * s}px`, height: `${r.height * s}px` });
+  $("zoomLabel").textContent = fmtZoom(cam.zoom);
+  // The anchor is the point that stays put on screen, so inside the box it sits at the same fraction.
+  Object.assign($("anchorDot").style, { left: `${cam.anchor[0] * 100}%`, top: `${cam.anchor[1] * 100}%` });
+}
 
 // Scrubber
 function renderScrubber() {
@@ -475,6 +558,8 @@ function markCheckpoint() {
     y: Math.round(live.desiredY),
     tokenId: last?.tokenId ?? state.selectedToken ?? state.tokens[0].id,
     hold: last?.hold ?? 1000,
+    zoom: 1,
+    anchor: [0.5, 0.5],
   });
   save();
   renderAll();
@@ -495,6 +580,17 @@ function tokenOptions(selected) {
   return state.tokens.map((t) => `<option value="${t.id}" ${t.id === selected ? "selected" : ""}>${esc(t.name)} · ${t.duration}ms</option>`).join("");
 }
 
+function zoomRow(item, id) {
+  const cam = camOf(item);
+  const picking = live.mode === "anchor" && live.anchorFor === id;
+  const text = picking ? "Click the preview…" : cam.zoom > 1 ? `⌖ ${Math.round(cam.anchor[0] * 100)}%, ${Math.round(cam.anchor[1] * 100)}%` : "⌖ Pick point";
+  return `
+        <div class="zoom-row">
+          <label class="field"><span>Zoom (×)</span><input type="number" data-k="zoom" value="${round2(cam.zoom)}" min="1" max="10" step="0.25" /></label>
+          <div class="field"><span>Zoom anchor</span><button class="btn anchor-btn ${picking ? "on" : ""}" data-act="anchor" title="Click a point in the preview. It stays in place while the view zooms around it.">${text}</button></div>
+        </div>`;
+}
+
 function renderCheckpoints() {
   $("startCard").innerHTML = `
     <div class="card start-card" data-kind="start">
@@ -506,7 +602,7 @@ function renderCheckpoints() {
           <div class="ypos"><input type="number" data-k="y" value="${state.start.y}" min="0" /><button class="btn icon" data-act="here" title="Use current position">⌖</button></div>
         </label>
         <label class="field"><span>Hold (ms)</span><input type="number" data-k="hold" value="${state.start.hold}" min="0" step="100" /></label>
-        <div></div>
+        <div></div>${zoomRow(state.start, "start")}
       </div>
     </div>`;
 
@@ -526,7 +622,7 @@ function renderCheckpoints() {
           <div class="ypos"><input type="number" data-k="y" value="${cp.y}" min="0" /><button class="btn icon" data-act="here" title="Use current position">⌖</button></div>
         </label>
         <label class="field"><span>Move easing</span><select data-k="tokenId">${tokenOptions(cp.tokenId)}</select></label>
-        <label class="field"><span>Hold (ms)</span><input type="number" data-k="hold" value="${cp.hold}" min="0" step="100" /></label>
+        <label class="field"><span>Hold (ms)</span><input type="number" data-k="hold" value="${cp.hold}" min="0" step="100" /></label>${zoomRow(cp, cp.id)}
       </div>
     </li>`
     )
@@ -559,8 +655,10 @@ panelRight.addEventListener("input", (e) => {
   const k = e.target.dataset.k;
   const t = k && cardTarget(e.target);
   if (!t) return;
-  t.item[k] = e.target.type === "number" ? Math.max(0, Number(e.target.value) || 0) : e.target.value;
+  if (k === "zoom") t.item.zoom = Math.max(1, Number(e.target.value) || 1);
+  else t.item[k] = e.target.type === "number" ? Math.max(0, Number(e.target.value) || 0) : e.target.value;
   save();
+  renderZoomBox();
   updateStats();
   drawTimeline();
   renderScrubber();
@@ -572,6 +670,17 @@ panelRight.addEventListener("click", (e) => {
   if (!t) return;
   const list = state.checkpoints;
   if (act === "go") scrollToY(t.item.y);
+  if (act === "anchor") {
+    if (!live.loaded) return toast("Load a page first");
+    const id = t.index === -1 ? "start" : t.item.id;
+    if (live.mode === "anchor" && live.anchorFor === id) return setMode("scroll");
+    scrollToY(t.item.y);
+    if (!(t.item.zoom > 1)) t.item.zoom = 2;
+    save();
+    setMode("anchor", id);
+    renderAll();
+    return toast("Click the point to zoom into");
+  }
   if (act === "here") {
     if (!live.loaded) return toast("Load a page first");
     t.item.y = Math.round(live.desiredY);
@@ -810,32 +919,38 @@ function buildTimeline() {
   const segs = [];
   let t = 0;
   let pos = cy(state.start.y);
+  let cam = camOf(state.start);
   const hold = (ms, label) => {
-    if (ms > 0) segs.push({ kind: "hold", t0: t, t1: t + ms, from: pos, to: pos, label });
+    if (ms > 0) segs.push({ kind: "hold", t0: t, t1: t + ms, from: pos, to: pos, cam0: cam, cam1: cam, label });
     t += Math.max(0, ms);
   };
   hold(state.start.hold, "S");
   state.checkpoints.forEach((cp, i) => {
     const tok = tokenById(cp.tokenId);
     const to = cy(cp.y);
-    segs.push({ kind: "move", t0: t, t1: t + tok.duration, from: pos, to, ease: cubicBezier(...tok.bezier), n: i + 1 });
+    const cam1 = camOf(cp);
+    segs.push({ kind: "move", t0: t, t1: t + tok.duration, from: pos, to, cam0: cam, cam1, ease: cubicBezier(...tok.bezier), n: i + 1 });
     t += tok.duration;
     pos = to;
+    cam = cam1;
     hold(cp.hold, i + 1);
   });
-  return { segs, total: t, start: cy(state.start.y) };
+  return { segs, total: t, start: cy(state.start.y), startCam: camOf(state.start), end: { y: pos, cam } };
 }
 
-function yAt(tl, ms) {
+// Scroll position and zoom at a time: { y, cam }.
+function stateAt(tl, ms) {
   for (const s of tl.segs) {
     if (ms < s.t1) {
-      if (s.kind === "hold") return s.from;
-      const p = (ms - s.t0) / Math.max(1, s.t1 - s.t0);
-      return s.from + (s.to - s.from) * s.ease(clamp(p, 0, 1));
+      if (s.kind === "hold") return { y: s.from, cam: s.cam1 };
+      const p = s.ease(clamp((ms - s.t0) / Math.max(1, s.t1 - s.t0), 0, 1));
+      return { y: s.from + (s.to - s.from) * p, cam: lerpCamera(s.cam0, s.cam1, p) };
     }
   }
-  return tl.segs.length ? tl.segs.at(-1).to : tl.start;
+  return tl.end;
 }
+const yAt = (tl, ms) => stateAt(tl, ms).y;
+const scrubTo = (st) => scrollToY(st.y, { camera: st.cam });
 
 function updateStats() {
   const tl = buildTimeline();
@@ -845,7 +960,8 @@ function updateStats() {
   $("timelineStats").textContent = `${fmtS(tl.total)} · ${frames} frames @ ${state.fps}fps · ${w}×${h}`;
 }
 
-const preview = { playing: false, t: 0, hover: null };
+// t is the playhead (ms). Playback runs from `from` at `startedAt`; dragging holds it in place.
+const preview = { playing: false, t: 0, hover: null, dragging: false, from: 0, startedAt: 0 };
 
 function drawTimeline() {
   const canvas = $("timeline");
@@ -935,19 +1051,39 @@ function drawTimeline() {
   dot(0, tl.start, "S", "#3ecf8e");
   for (const s of tl.segs) if (s.kind === "move") dot(s.t1, s.to, String(s.n), "#7c6cff");
 
-  // Playhead / hover
-  const head = preview.playing ? preview.t : preview.hover;
-  if (head != null) {
-    ctx.strokeStyle = preview.playing ? "#ff6b6b" : "rgba(255,255,255,0.4)";
-    ctx.lineWidth = 1;
+  // Zoom labels beside zoomed checkpoints
+  ctx.font = "10px -apple-system, system-ui, sans-serif";
+  ctx.fillStyle = "#a597ff";
+  ctx.textAlign = "left";
+  const zoomLabel = (ms, y, cam) => cam.zoom > 1 && ctx.fillText(fmtZoom(cam.zoom), X(ms) + 10, Y(y) + (Y(y) > padT + ph - 10 ? -10 : 10));
+  zoomLabel(0, tl.start, tl.startCam);
+  for (const s of tl.segs) if (s.kind === "move" && (s.cam1.zoom !== s.cam0.zoom || s.cam1.anchor !== s.cam0.anchor)) zoomLabel(s.t1, s.to, s.cam1);
+
+  // Hover line, then the playhead, labelled while it's in use (otherwise the hover gets the label)
+  preview.t = Math.min(preview.t, tl.total);
+  const line = (ms, color, width) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
     ctx.beginPath();
-    ctx.moveTo(X(head), padT);
-    ctx.lineTo(X(head), padT + ph);
+    ctx.moveTo(X(ms), padT);
+    ctx.lineTo(X(ms), padT + ph);
     ctx.stroke();
+  };
+  if (preview.hover != null && !preview.dragging) line(preview.hover, "rgba(255,255,255,0.3)", 1);
+  line(preview.t, preview.playing ? "#ff6b6b" : "#e7e8ea", 1.5);
+  ctx.beginPath();
+  ctx.moveTo(X(preview.t) - 5, padT - 6);
+  ctx.lineTo(X(preview.t) + 5, padT - 6);
+  ctx.lineTo(X(preview.t), padT);
+  ctx.fillStyle = preview.playing ? "#ff6b6b" : "#e7e8ea";
+  ctx.fill();
+  const head = preview.playing || preview.dragging || preview.hover == null ? preview.t : preview.hover;
+  {
     ctx.fillStyle = "#e7e8ea";
     ctx.textAlign = X(head) > W - 90 ? "right" : "left";
     ctx.font = "10px -apple-system, system-ui, sans-serif";
-    ctx.fillText(`${fmtS(head)} · ${Math.round(yAt(tl, head))}px`, X(head) + (ctx.textAlign === "left" ? 6 : -6), padT + 6);
+    const st = stateAt(tl, head);
+    ctx.fillText(`${fmtS(head)} · ${Math.round(st.y)}px${st.cam.zoom > 1.001 ? ` · ${fmtZoom(st.cam.zoom)}` : ""}`, X(head) + (ctx.textAlign === "left" ? 6 : -6), padT + 6);
   }
 
   canvas._map = { padL, pw, total };
@@ -962,17 +1098,35 @@ function drawTimeline() {
     const tl = buildTimeline();
     return clamp(((x - m.padL) / m.pw) * m.total, 0, tl.total);
   };
+  // Click or drag to move the playhead. While playing, playback holds during the drag and carries
+  // on from wherever it's released.
+  const seek = (e) => {
+    const ms = msAt(e);
+    if (ms == null) return;
+    preview.t = ms;
+    scrubTo(stateAt(buildTimeline(), ms));
+  };
   canvas.addEventListener("pointermove", (e) => {
     preview.hover = msAt(e);
-    if (e.buttons && !preview.playing) scrollToY(yAt(buildTimeline(), preview.hover));
+    if (preview.dragging) seek(e);
     drawTimeline();
   });
   canvas.addEventListener("pointerleave", () => ((preview.hover = null), drawTimeline()));
   canvas.addEventListener("pointerdown", (e) => {
-    if (preview.playing) stopPreview();
-    const ms = msAt(e);
-    if (ms != null) scrollToY(yAt(buildTimeline(), ms));
+    canvas.setPointerCapture(e.pointerId);
+    preview.dragging = true;
+    seek(e);
+    drawTimeline();
   });
+  const release = () => {
+    if (!preview.dragging) return;
+    preview.dragging = false;
+    preview.from = preview.t;
+    preview.startedAt = performance.now();
+    drawTimeline();
+  };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
 }
 
 function stopPreview() {
@@ -983,19 +1137,25 @@ function stopPreview() {
 $("previewBtn").addEventListener("click", () => {
   if (preview.playing) return stopPreview();
   if (!live.loaded) return toast("Load a page first");
-  const tl = buildTimeline();
   if (!state.checkpoints.length) return toast("Add a checkpoint first");
+  // Play from the playhead, or from the start if it's at the end.
+  if (preview.t >= buildTimeline().total - 1) preview.t = 0;
   preview.playing = true;
-  $("previewBtn").textContent = "■ Stop";
-  const t0 = performance.now();
+  preview.from = preview.t;
+  preview.startedAt = performance.now();
+  $("previewBtn").textContent = "❚❚ Pause";
   const tick = (now) => {
     if (!preview.playing) return;
-    preview.t = now - t0;
-    if (preview.t >= tl.total) {
-      scrollToY(yAt(tl, tl.total));
-      return stopPreview();
+    const tl = buildTimeline(); // picks up edits made while playing
+    if (!preview.dragging) {
+      preview.t = preview.from + (now - preview.startedAt);
+      if (preview.t >= tl.total) {
+        preview.t = tl.total;
+        scrubTo(stateAt(tl, tl.total));
+        return stopPreview();
+      }
+      scrubTo(stateAt(tl, preview.t));
     }
-    scrollToY(yAt(tl, preview.t));
     drawTimeline();
     requestAnimationFrame(tick);
   };
@@ -1008,10 +1168,13 @@ $("previewBtn").addEventListener("click", () => {
 
 function buildConfig() {
   const timeline = [];
+  // Only write zoom into the config when the project uses it, so plain scroll configs stay tidy.
+  const usesZoom = [state.start, ...state.checkpoints].some((c) => camOf(c).zoom > 1);
+  const zoomOf = (c) => (usesZoom ? { zoom: camOf(c).zoom, anchor: camOf(c).anchor } : {});
   if (state.start.hold > 0) timeline.push({ wait: state.start.hold / 1000 });
   for (const cp of state.checkpoints) {
     const tok = tokenById(cp.tokenId);
-    timeline.push({ scroll: cp.y, duration: tok.duration / 1000, easing: tok.bezier, token: tok.name, ...(cp.label ? { label: cp.label } : {}) });
+    timeline.push({ scroll: cp.y, ...zoomOf(cp), duration: tok.duration / 1000, easing: tok.bezier, token: tok.name, ...(cp.label ? { label: cp.label } : {}) });
     if (cp.hold > 0) timeline.push({ wait: cp.hold / 1000 });
   }
   return {
@@ -1024,6 +1187,7 @@ function buildConfig() {
     hideCookieBanners: state.hideCookieBanners,
     freshStart: state.freshStart,
     start: state.start.y,
+    ...(usesZoom ? { startZoom: camOf(state.start).zoom, startAnchor: camOf(state.start).anchor } : {}),
     timeline,
   };
 }

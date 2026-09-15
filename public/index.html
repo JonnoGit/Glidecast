@@ -99,6 +99,7 @@
           <div class="frame" id="frame">
             <img id="live" alt="" draggable="false" />
             <div class="hover-box" id="hoverBox" hidden></div>
+            <div class="zoom-box" id="zoomBox" hidden><span class="zoom-label" id="zoomLabel"></span><i class="anchor-dot" id="anchorDot"></i></div>
           </div>
           <div class="empty" id="empty">
             <div class="empty-inner">
@@ -119,7 +120,7 @@
           <h2>Timeline</h2>
           <span class="muted" id="timelineStats"></span>
           <div class="spacer"></div>
-          <button class="btn" id="previewBtn" title="Play the timing on the live page (no blur, approximate frame rate)">▶ Preview motion</button>
+          <button class="btn" id="previewBtn" title="Play the timing on the live page from the playhead (no blur, approximate frame rate). Click or drag the timeline to jump.">▶ Preview motion</button>
         </div>
         <canvas id="timeline"></canvas>
       </div>

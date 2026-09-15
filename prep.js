@@ -255,3 +255,78 @@ export async function preScroll(page, viewportHeight) {
   await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
   await page.evaluate(() => window.scrollTo(0, 0));
 }
+
+// Injected before any page script when the video zooms. The zoom happens outside the page, so on
+// its own the page never knows about it. Two things need to:
+//
+// - Scroll-triggered animations (IntersectionObserver) should fire when an element enters the
+//   zoomed shot, not the full viewport. Viewport observers are rebuilt with a rootMargin that shrinks
+//   the viewport to the camera rect, and repeat notifications from rebuilding are filtered out.
+// - Canvases (Rive, Lottie, three.js) size their bitmap by devicePixelRatio, so at 1× they would be
+//   upscaled when zoomed. Reporting a higher ratio makes them draw at the zoomed resolution.
+export function cameraScript(pixelRatio) {
+  return `(() => {
+  if (window.__srSetCamera) return;
+  const ratio = ${Number(pixelRatio) || 0};
+  if (ratio > window.devicePixelRatio) Object.defineProperty(window, "devicePixelRatio", { get: () => ratio, configurable: true });
+
+  const RealIO = window.IntersectionObserver;
+  if (!RealIO) return (window.__srSetCamera = () => {});
+  let cam = null; // { x, y, width, height } in viewport CSS px; null = whole viewport
+  const live = new Set();
+  const sides = (m) => {
+    const v = String(m || "0px").trim().split(/\\s+/);
+    return [v[0], v[1] ?? v[0], v[2] ?? v[0], v[3] ?? v[1] ?? v[0]];
+  };
+  const toPx = (v, size) => (String(v).endsWith("%") ? (parseFloat(v) / 100) * size : parseFloat(v) || 0);
+
+  class CameraIntersectionObserver {
+    constructor(callback, options = {}) {
+      this._cb = callback;
+      this._opts = options;
+      this._targets = new Set();
+      this._last = new WeakMap();
+      const t = options.threshold ?? 0;
+      this._thresholds = (Array.isArray(t) ? [...t] : [t]).sort((a, b) => a - b);
+      this._build();
+    }
+    get root() { return this._opts.root ?? null; }
+    get rootMargin() { return this._opts.rootMargin ?? "0px 0px 0px 0px"; }
+    get thresholds() { return this._thresholds; }
+    _build() {
+      this._io?.disconnect();
+      let opts = this._opts;
+      if (cam && !opts.root) {
+        const W = window.innerWidth, H = window.innerHeight;
+        const [t, r, b, l] = sides(opts.rootMargin);
+        const m = [toPx(t, H) - cam.y, toPx(r, W) - (W - cam.x - cam.width), toPx(b, H) - (H - cam.y - cam.height), toPx(l, W) - cam.x];
+        opts = { ...opts, rootMargin: m.map((v) => v + "px").join(" ") };
+      }
+      this._io = new RealIO((entries) => {
+        // Rebuilding re-reports every target; only pass on real changes (or first reports).
+        const changed = entries.filter((e) => {
+          const bucket = this._thresholds.filter((t) => e.intersectionRatio >= t).length;
+          const state = (e.isIntersecting ? "1:" : "0:") + bucket;
+          const prev = this._last.get(e.target);
+          this._last.set(e.target, state);
+          return prev !== state;
+        });
+        if (changed.length) this._cb.call(this, changed, this);
+      }, opts);
+      for (const el of this._targets) this._io.observe(el);
+    }
+    observe(el) { this._targets.add(el); live.add(this); this._io.observe(el); }
+    unobserve(el) { this._targets.delete(el); this._last.delete(el); this._io.unobserve(el); }
+    disconnect() { this._targets.clear(); live.delete(this); this._io.disconnect(); }
+    takeRecords() { return this._io.takeRecords(); }
+  }
+  window.IntersectionObserver = CameraIntersectionObserver;
+
+  window.__srSetCamera = (rect) => {
+    const key = (r) => (r ? [r.x, r.y, r.width, r.height].map(Math.round).join() : "");
+    if (key(rect) === key(cam)) return;
+    cam = rect;
+    for (const o of live) if (!o._opts.root) o._build();
+  };
+})();`;
+}

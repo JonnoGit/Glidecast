@@ -314,8 +314,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname.startsWith("/renders/")) {
       return serveFile(req, res, path.join(RENDERS, path.basename(decodeURIComponent(url.pathname))));
     }
-    if (req.method === "GET" && url.pathname === "/easing.js") {
-      return serveFile(req, res, path.join(ROOT, "easing.js"));
+    if (req.method === "GET" && (url.pathname === "/easing.js" || url.pathname === "/camera.js")) {
+      return serveFile(req, res, path.join(ROOT, url.pathname.slice(1)));
     }
     if (req.method === "GET") {
       const rel = url.pathname === "/" ? "index.html" : url.pathname.slice(1);

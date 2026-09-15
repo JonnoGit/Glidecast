@@ -12,8 +12,9 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { cameraRect, DEFAULT_CAMERA, lerpCamera, normCamera } from "./camera.js";
 import { resolveEasing } from "./easing.js";
-import { applyCss, getMaxScroll, GPU_ARGS, preScroll, START_PAUSED_SCRIPT, VIRTUAL_TIME_SCRIPT } from "./prep.js";
+import { applyCss, cameraScript, getMaxScroll, GPU_ARGS, preScroll, START_PAUSED_SCRIPT, VIRTUAL_TIME_SCRIPT } from "./prep.js";
 
 const DEFAULTS = {
   viewport: { width: 1920, height: 1080, deviceScaleFactor: 1 },
@@ -22,12 +23,17 @@ const DEFAULTS = {
   motionBlur: { enabled: true, samples: 64, shutterAngle: 180, maxStepPx: 1 },
   easing: "easeInOutCubic",
   start: 0,
+  startZoom: 1, // initial zoom (1 = none)
+  startAnchor: [0.5, 0.5], // point on the viewport (fractions) that stays put while zooming
   waitUntil: "networkidle",
   preScroll: true, // walk the page once first so lazy-loaded images/sections exist
   settleMs: 500,
   gpu: true, // hardware WebGL; set false if a page renders incorrectly
   freshStart: true, // reload after measuring so load-in and scroll-triggered animations aren't pre-played
   virtualTime: true, // step the page's clock with the video so animations play at real speed
+  waitForLoads: 3000, // max ms per frame to wait for network loads, so they take no video time (0 = off)
+  maxCanvasScale: 6, // cap on the devicePixelRatio reported to canvases when zooming
+  triggerInset: 24, // on-screen px at the frame edges that don't count as "in view" for scroll triggers
   freezeAnimations: false, // stop CSS/Web Animations entirely (overrides virtual stepping for them)
   hideSelectors: [], // extra elements to hide
   hideCookieBanners: true, // hide known consent-manager banners (OneTrust, Cookiebot, …)
@@ -85,44 +91,68 @@ async function resolveTarget(page, target, current, maxScroll, vh) {
   return clamp(y + offset);
 }
 
-// Turns the timeline into segments on an absolute clock: { t0, t1, from, to, ease }.
+// Turns the timeline into segments on an absolute clock: { t0, t1, from, to, cam0, cam1, ease }.
+// A scroll step may also zoom: "zoom" (1 = none) and "anchor" [x, y]; if omitted, the zoom carries over.
 async function buildTimeline(page, cfg, maxScroll) {
   const vh = cfg.viewport.height;
   let pos = await resolveTarget(page, cfg.start, 0, maxScroll, vh);
+  let cam = normCamera(cfg.startZoom, cfg.startAnchor);
+  const startPos = pos;
+  const startCam = cam;
   let t = 0;
   const segments = [];
   for (const [i, step] of cfg.timeline.entries()) {
     if ("wait" in step || "hold" in step) {
       const d = Number(step.wait ?? step.hold);
-      segments.push({ t0: t, t1: t + d, from: pos, to: pos, ease: (x) => x });
+      segments.push({ t0: t, t1: t + d, from: pos, to: pos, cam0: cam, cam1: cam, ease: (x) => x });
       t += d;
-    } else if ("scroll" in step || "scrollTo" in step) {
-      const to = await resolveTarget(page, step.scroll ?? step.scrollTo, pos, maxScroll, vh);
+    } else if ("scroll" in step || "scrollTo" in step || "zoom" in step) {
+      const target = step.scroll ?? step.scrollTo;
+      const to = target == null ? pos : await resolveTarget(page, target, pos, maxScroll, vh);
+      const cam1 = "zoom" in step || "anchor" in step ? normCamera(step.zoom ?? cam.zoom, step.anchor ?? cam.anchor) : cam;
       const dist = Math.abs(to - pos);
-      const d = step.duration ?? (step.speed ? dist / step.speed : null);
-      if (d == null) throw new Error(`Timeline step ${i}: scroll needs "duration" (s) or "speed" (px/s)`);
-      segments.push({ t0: t, t1: t + d, from: pos, to, ease: resolveEasing(step.easing ?? cfg.easing, d) });
-      console.log(`  step ${i}: scroll ${Math.round(pos)} → ${Math.round(to)}px over ${d.toFixed(2)}s`);
+      const d = step.duration ?? (step.speed && dist ? dist / step.speed : null);
+      if (d == null) throw new Error(`Timeline step ${i}: scroll/zoom needs "duration" (s) or "speed" (px/s)`);
+      segments.push({ t0: t, t1: t + d, from: pos, to, cam0: cam, cam1, ease: resolveEasing(step.easing ?? cfg.easing, d) });
+      const zoomMsg = cam1.zoom !== cam.zoom || cam1.anchor !== cam.anchor ? `, zoom ${cam.zoom}× → ${cam1.zoom}×` : "";
+      console.log(`  step ${i}: scroll ${Math.round(pos)} → ${Math.round(to)}px${zoomMsg} over ${d.toFixed(2)}s`);
       pos = to;
+      cam = cam1;
       t += d;
     } else {
-      throw new Error(`Timeline step ${i}: expected "scroll" or "wait", got ${JSON.stringify(step)}`);
+      throw new Error(`Timeline step ${i}: expected "scroll", "zoom" or "wait", got ${JSON.stringify(step)}`);
     }
   }
-  return { segments, duration: t, finalPos: pos };
+  const usesZoom = startCam.zoom > 1 || segments.some((s) => s.cam1.zoom > 1);
+  return { segments, duration: t, start: { y: startPos, cam: startCam }, final: { y: pos, cam }, usesZoom };
 }
 
-function scrollAt(timeline, time) {
+// Scroll position and camera at a time: { y, cam }.
+function stateAt(timeline, time) {
   const { segments } = timeline;
-  if (!segments.length) return 0;
-  if (time <= 0) return segments[0].from;
+  if (!segments.length || time <= 0) return timeline.start;
   for (const s of segments) {
     if (time < s.t1) {
-      const p = s.t1 === s.t0 ? 1 : (time - s.t0) / (s.t1 - s.t0);
-      return s.from + (s.to - s.from) * s.ease(p);
+      const p = s.t1 === s.t0 ? 1 : s.ease((time - s.t0) / (s.t1 - s.t0));
+      const cam = s.cam0 === s.cam1 ? s.cam0 : lerpCamera(s.cam0, s.cam1, p);
+      return { y: s.from + (s.to - s.from) * p, cam };
     }
   }
-  return timeline.finalPos;
+  return timeline.final;
+}
+
+// How far the output image moves between two states, in output px (max over the frame corners).
+function travelPx(a, b, vw, vh) {
+  const ra = cameraRect(a.cam, vw, vh);
+  const rb = cameraRect(b.cam, vw, vh);
+  const zoom = Math.max(a.cam.zoom, b.cam.zoom);
+  let max = 0;
+  for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+    const dx = rb.x + u * rb.width - (ra.x + u * ra.width);
+    const dy = b.y + rb.y + v * rb.height - (a.y + ra.y + v * ra.height);
+    max = Math.max(max, Math.hypot(dx, dy) * zoom);
+  }
+  return max;
 }
 
 // --- ffmpeg ------------------------------------------------------------------
@@ -207,7 +237,27 @@ async function main() {
   // Virtual clock: runs in real time while loading, then gets paused and stepped exactly 1/fps
   // per frame, so animation (Rive, Lottie, GSAP, CSS, video) plays at true speed however slow capture is.
   if (cfg.virtualTime) await context.addInitScript(VIRTUAL_TIME_SCRIPT);
+  const maxZoom = Math.max(normCamera(cfg.startZoom).zoom, ...cfg.timeline.map((st) => normCamera(st.zoom).zoom));
+  if (maxZoom > 1 || cfg.triggerInset > 0) {
+    const ratio = Math.min(cfg.maxCanvasScale, cfg.viewport.deviceScaleFactor * maxZoom);
+    await context.addInitScript(cameraScript(ratio));
+  }
   const page = await context.newPage();
+
+  // Network loads (a Rive file, a lazy image, a video segment) finish on the real clock. Track them,
+  // so each frame can wait for them while the page clock is stopped and they take no video time.
+  // Requests pending for over 10s are treated as streams and ignored.
+  const WAITED_TYPES = new Set(["document", "stylesheet", "image", "font", "script", "fetch", "xhr"]);
+  const pending = new Map();
+  let lastNetActivity = 0;
+  page.on("request", (r) => {
+    if (!WAITED_TYPES.has(r.resourceType())) return;
+    pending.set(r, Date.now());
+    lastNetActivity = Date.now();
+  });
+  const settled = (r) => pending.delete(r) && (lastNetActivity = Date.now());
+  page.on("requestfinished", settled);
+  page.on("requestfailed", settled);
 
   try {
     console.log(`Loading ${cfg.url}`);
@@ -237,13 +287,31 @@ async function main() {
     const dpr = cfg.viewport.deviceScaleFactor;
     console.log(
       `Rendering ${totalFrames} frames @ ${cfg.fps}fps (${timeline.duration.toFixed(2)}s), ` +
+        (timeline.usesZoom ? "zoom, " : "") +
         (blur ? `${samples} samples, ${cfg.motionBlur.shutterAngle}° shutter` : "no motion blur") +
         ` → ${path.relative(process.cwd(), out)}`
     );
 
     const encoder = startEncoder(out, { fps: cfg.fps, samples, captureFormat: cfg.captureFormat, quality: cfg.quality });
 
-    let lastY = null;
+    const { width: vw, height: vh } = cfg.viewport;
+    // Zoom uses the emulated visible area, which the page can't observe (no resize, same layout).
+    // Unlike screenshot clips, the output stays exactly viewport-sized, which ffmpeg needs. Chromium
+    // applies the device scale factor to it twice, so compensate: scale / dpr, and offsets from the
+    // current scroll position × dpr.
+    let zoomed = true; // set the metrics once up front too: raw CDP screenshots otherwise ignore deviceScaleFactor
+    const setZoomView = async (view) => {
+      if (!view && !zoomed) return;
+      zoomed = !!view;
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        width: vw,
+        height: vh,
+        deviceScaleFactor: dpr,
+        mobile: false,
+        ...(view ? { viewport: { x: view.x * dpr, y: view.scrollY + (view.y - view.scrollY) * dpr, width: vw / view.zoom, height: vh / view.zoom, scale: view.zoom / dpr } } : {}),
+      });
+    };
+    let lastKey = null;
     let lastShot = null;
     let shots = 0;
     const started = Date.now();
@@ -258,7 +326,7 @@ async function main() {
       // script, so all of that plays from frame 0 / when the video actually scrolls there.
       console.log("Reloading for a fresh start (intro animations play from frame 0)…");
       if (cfg.virtualTime) await page.addInitScript(START_PAUSED_SCRIPT);
-      await page.evaluate((y) => window.scrollTo(0, y), timeline.segments[0]?.from ?? 0);
+      await page.evaluate((y) => window.scrollTo(0, y), timeline.start.y);
       await page.reload({ waitUntil: "load", timeout: 90_000 }).catch((err) => {
         if (!/Timeout/.test(err.message)) throw err;
       });
@@ -280,16 +348,32 @@ async function main() {
     }
     if (cfg.virtualTime) await page.evaluate((f) => (window.__srFreezeCss = f), !!cfg.freezeAnimations);
 
+    await setZoomView(null);
+
+    // Wait for in-flight loads (and the work they kick off, like decoding a Rive file) without
+    // advancing page time. dt=0 steps flush the promise chains and animation frames they queue.
+    const settleLoads = async () => {
+      if (!cfg.virtualTime || !cfg.waitForLoads) return;
+      const deadline = Date.now() + cfg.waitForLoads;
+      for (;;) {
+        const now = Date.now();
+        for (const [r, t] of pending) if (now - t > 10_000) pending.delete(r);
+        if ((!pending.size && now - lastNetActivity > 120) || now > deadline) return;
+        await page.evaluate(() => window.__srAdvance(0));
+        await page.waitForTimeout(16);
+      }
+    };
+
     for (let f = 0; f < totalFrames; f++) {
       // Adaptive sampling: only take as many distinct sub-frame shots as the motion inside
       // this frame's shutter window needs (spacing <= maxStepPx), then repeat each one so
       // ffmpeg always averages exactly `samples` images per frame.
       let unique = 1;
       if (samples > 1) {
-        const yOpen = scrollAt(timeline, clampTime((f - shutter / 2) / cfg.fps));
-        const yMid = scrollAt(timeline, clampTime(f / cfg.fps));
-        const yClose = scrollAt(timeline, clampTime((f + shutter / 2) / cfg.fps));
-        const travel = (Math.abs(yMid - yOpen) + Math.abs(yClose - yMid)) * dpr;
+        const open = stateAt(timeline, clampTime((f - shutter / 2) / cfg.fps));
+        const mid = stateAt(timeline, clampTime(f / cfg.fps));
+        const close = stateAt(timeline, clampTime((f + shutter / 2) / cfg.fps));
+        const travel = (travelPx(open, mid, vw, vh) + travelPx(mid, close, vw, vh)) * dpr;
         unique = Math.min(samples, Math.max(1, Math.ceil(travel / maxStep)));
       }
 
@@ -298,35 +382,56 @@ async function main() {
         // Sub-frame instants spread across the shutter window, centered on the frame time.
         const offset = unique > 1 ? ((k + 0.5) / unique - 0.5) * shutter : 0;
         const time = clampTime((f + offset) / cfg.fps);
+        const st = stateAt(timeline, time);
         // Snap to device pixels: the compositor can't render finer than that anyway.
-        const y = Math.round(scrollAt(timeline, time) * dpr) / dpr;
+        const y = Math.round(st.y * dpr) / dpr;
+        // Zoomed: show just the visible part of the viewport, re-rendered at the zoom scale so it stays
+        // sharp. Its position is in document coordinates and keeps the exact sub-pixel scroll.
+        let view = null;
+        let camRect = null; // the shot in viewport CSS px, for the page's scroll triggers
+        if (st.cam.zoom > 1.0005) {
+          const r = cameraRect(st.cam, vw, vh);
+          view = { x: r.x, y: Math.max(y, Math.min(y + vh - r.height, st.y + r.y)), zoom: st.cam.zoom, scrollY: y };
+          camRect = { x: r.x, y: view.y - y, width: r.width, height: r.height };
+        }
+        if (cfg.triggerInset > 0) {
+          // A sliver at the edge of the shot shouldn't start an animation (it would play unseen).
+          const r = camRect ?? { x: 0, y: 0, width: vw, height: vh };
+          const i = Math.min(cfg.triggerInset / st.cam.zoom, r.width / 4, r.height / 4);
+          camRect = { x: r.x + i, y: r.y + i, width: r.width - 2 * i, height: r.height - 2 * i };
+        }
+        const key = view ? `${y}|${view.x}|${view.y}|${view.zoom}` : String(y);
 
         // With a virtual clock the page keeps changing even when scroll doesn't, so capture every
         // distinct sub-frame instant (holds still collapse to one shot per frame via `unique`).
-        const needShot = cfg.virtualTime ? s === 0 || k !== Math.floor(((s - 1) * unique) / samples) : y !== lastY;
+        const needShot = cfg.virtualTime ? s === 0 || k !== Math.floor(((s - 1) * unique) / samples) : key !== lastKey;
 
         if (needShot || !lastShot) {
           if (cfg.virtualTime) {
             const target = time * 1000;
             const dt = target - animMs;
             animMs = target;
-            await page.evaluate(({ y, dt }) => {
+            await page.evaluate(({ y, dt, camRect }) => {
               window.scrollTo({ top: y, behavior: "instant" });
+              window.__srSetCamera?.(camRect);
               return window.__srAdvance(dt); // resolves once any videos have seeked
-            }, { y, dt });
+            }, { y, dt, camRect });
+            await settleLoads();
           } else {
-            await page.evaluate((y) => {
+            await page.evaluate(({ y, camRect }) => {
               window.scrollTo({ top: y, behavior: "instant" });
+              window.__srSetCamera?.(camRect);
               return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-            }, y);
+            }, { y, camRect });
           }
+          await setZoomView(view);
           const { data } = await cdp.send("Page.captureScreenshot", {
             format: cfg.captureFormat,
             ...(cfg.captureFormat === "jpeg" ? { quality: 95 } : {}),
             optimizeForSpeed: true,
           });
           lastShot = Buffer.from(data, "base64");
-          lastY = y;
+          lastKey = key;
           shots++;
         }
         await encoder.write(lastShot);
